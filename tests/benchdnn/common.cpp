@@ -378,6 +378,24 @@ int batch(const char *fname, bench_f bench) {
             continue;
         }
 
+        // Join a double-quoted --opt="a b" value.
+        const auto eq = str.find("=\"");
+        if (str.rfind("--", 0) == 0 && eq != std::string::npos) {
+            bool closed = str.size() > eq + 2 && str.back() == '"';
+            std::string piece;
+            while (!closed && ifs >> piece) {
+                str += " " + piece;
+                closed = piece.back() == '"';
+            }
+            if (!closed) {
+                BENCHDNN_PRINT(
+                        0, "Error: unterminated quote in '%s'\n", str.c_str());
+                SAFE_V(FAIL);
+            }
+            str.pop_back();
+            str.erase(eq + 1, 1);
+        }
+
         // shell style line break
         if (continued_line) {
             if (opts.empty()) SAFE_V(FAIL);
