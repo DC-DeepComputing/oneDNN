@@ -342,17 +342,9 @@ status_t brgemm_matmul_t<isa>::pd_t::init(const engine_t *engine) {
                              bgmmc_.N % 8 == 0),
             "unsupported configuration");
 
-    // ZP per M,N compensation doesn't support strided cases yet.
+    // Layout / ISA constraints of the per-(M, N) compensation are owned by
+    // its JIT kernel.
     if (bgmmc_.with_per_mn_compensation) {
-        VDISPATCH_MATMUL(bgmmc_.A_strides[0] == 1 && bgmmc_.B_strides[0] == 1,
-                VERBOSE_UNSUPPORTED_TAG);
-        const bool wei_is_subbyte = utils::one_of(wei_dt, s4, u4);
-        if (wei_is_subbyte) {
-            VDISPATCH_MATMUL(
-                    bgmmc_.N_blk % 2 == 0 && bgmmc_.B_strides[1] % 2 == 0,
-                    VERBOSE_UNSUPPORTED_TAG);
-        }
-        // Pre-validate the per-(M, N) JIT kernel constraints
         VDISPATCH_MATMUL(
                 per_mn_comp_kernel_t::is_applicable(&bgmmc_) == status::success,
                 VERBOSE_UNSUPPORTED_FEATURE,
@@ -1055,14 +1047,11 @@ void brgemm_matmul_t<isa>::fill_per_mn_compensation(
             = brgmm_ctx.get_src_zp_ptr(b_idx, k_start, m, &src_zp_nibble_idx);
     const void *wei_zp_ptr = brgmm_ctx.get_wei_zp_ptr(b_idx, k_start, n);
 
-    const bool wei_is_subbyte
-            = utils::one_of(bgmmc.orig_wei_dt, data_type::s4, data_type::u4);
-    const dim_t wei_k_stride
-            = wei_is_subbyte ? bgmmc.B_strides[1] / 2 : bgmmc.B_strides[1];
-
     per_mn_comp_kernel_t::ctx_t kctx;
     kctx.src_batch_ptr = A_data_batch_ptr + k_start * bgmmc.A_strides[0];
-    kctx.wei_batch_ptr = B_data_batch_ptr + k_start * wei_k_stride;
+    // Weights at (k_start, n = 0): the kernel applies the N offset itself.
+    kctx.wei_batch_ptr
+            = brgmm_ctx.get_data_B_kn_ptr(B_data_batch_ptr, k_start, 0);
     kctx.src_zp_ptr = src_zp_ptr;
     kctx.src_zp_nibble_idx = src_zp_nibble_idx;
     kctx.wei_zp_ptr = wei_zp_ptr;
