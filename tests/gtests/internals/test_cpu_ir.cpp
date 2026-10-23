@@ -267,13 +267,11 @@ public:
     //                     right-hand-side pointer array
     //   dst_orig_offset - byte offset in the argument struct of the
     //                     destination origin pointer
-    //   tail_elems      - right-hand-side elements a partial (tail) load reads
     struct postops_cfg_t {
         const impl::post_ops_t *post_ops = nullptr;
         const impl::memory_desc_t *dst_md = nullptr;
         size_t rhs_arg_offset = 0;
         size_t dst_orig_offset = 0;
-        int tail_elems = 0;
     };
     void set_postops(const postops_cfg_t &cfg) { postops_cfg_ = cfg; }
 
@@ -319,8 +317,8 @@ protected:
             injector.reset(new postops_injector_t(*this, max_cpu_isa(),
                     *postops_cfg_.post_ops, *postops_cfg_.dst_md, abi_param1,
                     static_cast<int>(postops_cfg_.rhs_arg_offset),
-                    postops_cfg_.dst_orig_offset, postops_cfg_.tail_elems,
-                    eltwise_opmask, binary_tail_opmask));
+                    postops_cfg_.dst_orig_offset, ir_, eltwise_opmask,
+                    binary_tail_opmask));
         }
 
         preamble();
@@ -592,7 +590,7 @@ TEST(IRBuilderTests, InjectPostopsRecordsArgsAndDefUse) {
     for (int r = 0; r < n; r++)
         out_byte_off[r] = r * (dim_t)sizeof(float);
 
-    ir.inject_postops(acc, base, out_byte_off);
+    ir.inject_postops(acc, base, out_byte_off, /*n_elems=*/1);
 
     const int idx = find_op(ir, op_kind_t::inject_postops);
     ASSERT_NE(idx, -1);
@@ -604,6 +602,7 @@ TEST(IRBuilderTests, InjectPostopsRecordsArgsAndDefUse) {
     EXPECT_EQ(args.acc, acc);
     EXPECT_EQ(args.base_ptr, base);
     EXPECT_EQ(args.out_byte_off, out_byte_off);
+    EXPECT_EQ(args.n_elems, 1);
 
     // def_use reports every accumulator as read and written, and the base
     // pointer as read.
@@ -1442,7 +1441,7 @@ TEST(IntegrationTests, BinaryPostOpAddsPerElementRhs) {
     std::vector<dim_t> out_byte_off(n);
     for (int r = 0; r < n; r++)
         out_byte_off[r] = r * (dim_t)sizeof(float);
-    ir.inject_postops(acc, c_ptr, out_byte_off);
+    ir.inject_postops(acc, c_ptr, out_byte_off, /*n_elems=*/1);
 
     for (int r = 0; r < n; r++)
         ir.vstore_scalar(
@@ -1454,7 +1453,6 @@ TEST(IntegrationTests, BinaryPostOpAddsPerElementRhs) {
     cfg.dst_md = &dst_md;
     cfg.rhs_arg_offset = offsetof(binary_args_t, binary_rhs);
     cfg.dst_orig_offset = offsetof(binary_args_t, dst_orig);
-    cfg.tail_elems = 1;
     kernel.set_postops(cfg);
 
     ASSERT_TRUE(kernel.run_ir_pipeline());
@@ -1513,7 +1511,7 @@ TEST(IntegrationTests, InjectPostopsWorksWithAnyRegisterLayout) {
     acc[1] = ir.new_vec(f32);
     ir.vload(acc[1], a_ptr, vlen, f32);
 
-    ir.inject_postops(acc, c_ptr, {0, vlen});
+    ir.inject_postops(acc, c_ptr, {0, vlen}, simd_w());
     for (int r = 0; r < 2; r++)
         ir.vstore(c_ptr, r * vlen, acc[r], f32);
     for (int i = 0; i < n_live; i++)
