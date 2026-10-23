@@ -1590,7 +1590,9 @@ void brgemm_matmul_t<isa>::copy_b_chunk_in_buffer(
         ctx.src_scales_ptr = brgmm_ctx.get_src_scales_ptr(b_idx);
         ctx.wei_scales_ptr = brgmm_ctx.get_wei_scales_ptr(b_idx, k, n);
         ctx.zp_b_value_ptr = brgmm_ctx.get_wei_zp_ptr(b_idx, k, n);
-        if (bgmmc.blocked_B && !bgmmc.is_f16_with_int_wei
+        // Blocked f16 weights on avx512_core_fp16 are up-converted to the f32
+        // buffer as is, the blocked layout is the same.
+        if (bgmmc.blocked_B && bgmmc.orig_wei_dt == data_type::f16
                 && isa == avx512_core_fp16) {
             cvt_float16_to_float((float *)ctx.tr_src, (float16_t *)ctx.src,
                     bgmmc.wei_n_blk * ctx.current_K_iters);
