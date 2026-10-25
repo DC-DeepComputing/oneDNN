@@ -32,7 +32,6 @@
 #include "gemmstone/kernel_selector.hpp"
 #include "gemmstone/strategy_parser.hpp"
 #include "gpu/intel/compute/device_info.hpp"
-#include "gpu/intel/gemm/config.hpp"
 #include "gpu/intel/gemm/jit/gen_kernel_db.hpp"
 #include "gpu/intel/gemm/jit/pd.hpp"
 #include "gpu/intel/jit/ir/hw.hpp"
@@ -801,10 +800,6 @@ status_t gen_xe_systolic_kernel_desc_t::select_kernel(
         gpu_post_ops_t &&post_ops) {
     using namespace ngen;
     using namespace kcatalog;
-
-    // A rank only indexes jit:gemm candidates.
-    kernel_override_ = gpu_utils::dev_getenv("GEMM_KERNEL", std::string());
-    if (kernel_rank(kernel_override_) >= 0) kernel_override_.clear();
 
     product_ = dev_info.product();
     hw_ = getCore(product_.family);
