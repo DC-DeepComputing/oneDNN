@@ -78,8 +78,8 @@ where *matmul-knobs* are:
  - `--gpu-kernel=STR` -- GPU kernel override passed to the implementation
             via a primitive attribute. `N` selects the Nth candidate after
             sort (rank); `A-B` runs ranks `A` through `B` and `all` runs every
-            rank, both clamped to the problem's candidate count (a problem
-            without candidates runs without an override); any other string
+            rank, both clamped to the problem's candidate count (a range
+            without any candidate is an error); any other string
             is a strategy override. A strategy string contains spaces, so it must
             be double-quoted (e.g. `--gpu-kernel="gemm ..."`) on the command
             line and in batch files. Empty by default (no override). Ignored on

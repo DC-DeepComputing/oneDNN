@@ -46,24 +46,25 @@ static bool parse_range(const std::string &v, int &beg, int &end) {
     return true;
 }
 
-// Expands `all`/`A-B` into the problem's valid ranks; no override if none.
+// Expands `all`/`A-B` into the problem's valid ranks; fails if none.
 template <typename make_prb_t>
 static std::vector<std::string> expand_gpu_kernel(
         const std::string &v, const make_prb_t &make_prb) {
     int beg = 0, end = std::numeric_limits<int>::max();
     if (v != "all" && !parse_range(v, beg, end)) return {v};
+    if (!is_gpu()) return {""};
     auto prb = make_prb("");
+    const int count = query_gpu_kernel_count(prb.get());
     std::vector<std::string> ranks;
-    const int last = std::min(end, query_gpu_kernel_count(prb.get()) - 1);
-    for (int r = beg; r <= last; r++)
+    for (int r = beg; r <= std::min(end, count - 1); r++)
         ranks.push_back(std::to_string(r));
     if (ranks.empty()) {
-        if (is_gpu())
-            BENCHDNN_PRINT(0,
-                    "WARNING: --gpu-kernel=%s: no jit:gemm candidates, "
-                    "running without override: %s\n",
-                    v.c_str(), prb->str());
-        ranks.emplace_back();
+        fprintf(stderr,
+                "ERROR: matmul driver: --gpu-kernel=%s: no jit:gemm "
+                "candidates in range (count: %d): %s\n",
+                v.c_str(), count, prb->str()),
+                fflush(stderr);
+        SAFE_V(FAIL);
     }
     return ranks;
 }
