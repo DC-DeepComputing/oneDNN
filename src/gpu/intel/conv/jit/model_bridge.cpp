@@ -178,31 +178,29 @@ std::vector<uint8_t> unpack_data(const std::vector<uint64_t> &data_u64) {
 }
 
 gradient_boost_regressor_t &get_gbr(const config_t &cfg) {
+    using data_func_t = std::vector<uint64_t> (*)();
     // clang-format off
-    static const std::unordered_map<gbr_kind_t,
-            const std::vector<uint64_t> *, gbr_kind_hash_t>
+    static const std::unordered_map<gbr_kind_t, data_func_t, gbr_kind_hash_t>
             kind2data = {
-                    {gbr_kind_t::xehpc_common, &get_model_xehpc_common_data()},
-                    {gbr_kind_t::xehpg_common, &get_model_xehpg_common_data()},
-                    {gbr_kind_t::xehpc_dw, &get_model_xehpc_dw_data()},
-                    {gbr_kind_t::xehpg_dw, &get_model_xehpg_dw_data()}
+                    {gbr_kind_t::xehpc_common, get_model_xehpc_common_data},
+                    {gbr_kind_t::xehpg_common, get_model_xehpg_common_data},
+                    {gbr_kind_t::xehpc_dw, get_model_xehpc_dw_data},
+                    {gbr_kind_t::xehpg_dw, get_model_xehpg_dw_data}
             };
     // clang-format on
-    static std::unordered_map<gbr_kind_t, gradient_boost_regressor_t,
-            gbr_kind_hash_t>
-            gbr_map;
-    static std::once_flag flag;
-    std::call_once(flag, [&] {
-        for (auto &kv : kind2data) {
-            auto kind = kv.first;
-            auto &data = *kv.second;
-            auto s = serialization_stream_t::from_data(unpack_data(data));
-            deserializer_t d(s);
-            gbr_map[kind] = gradient_boost_regressor_t::deserialize(d);
-        }
-    });
+    static const int nkinds = (int)gbr_kind_t::_max;
+    static gradient_boost_regressor_t gbrs[nkinds];
+    static std::once_flag flags[nkinds];
     auto kind = get_gbr_kind(cfg);
-    return gbr_map.at(kind);
+    auto &gbr = gbrs[(int)kind];
+    // Deserialize lazily, on first use.
+    std::call_once(flags[(int)kind], [&] {
+        auto s = serialization_stream_t::from_data(
+                unpack_data(kind2data.at(kind)()));
+        deserializer_t d(s);
+        gbr = gradient_boost_regressor_t::deserialize(d);
+    });
+    return gbr;
 }
 
 float get_score(const config_t &cfg, const blocking_params_t &params) {
