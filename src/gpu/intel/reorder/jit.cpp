@@ -167,6 +167,31 @@ status_t gen_t::pd_t::init(const impl::engine_t *engine,
             VERBOSE_UNSUPPORTED_TENSOR_LAYOUT, "src");
     VDISPATCH_REORDER(byte_aligned(cfg->dst_layout().user()),
             VERBOSE_UNSUPPORTED_TENSOR_LAYOUT, "dst");
+
+    // The sub-byte (2/4-bit) store codegen mis-packs fields in two situations
+    // that pass the byte_aligned() gate above:
+    //  * the innermost contiguous run does not fill whole bytes, leaving a
+    //    partial trailing byte (wrong regardless of outer dimensions), and
+    //  * the innermost contiguous run is byte- but not dword-aligned while
+    //    strided outer dimensions exist, so a packed group straddles the outer
+    //    byte boundary and merges fields from two outer indices into one byte.
+    // Reject these layouts to fall back to a reference implementation.
+    auto packed_store_ok = [&](const layout_t &layout) {
+        const auto packing = layout.type().packing();
+        if (packing == 1) return true;
+        dim_t inner = 1;
+        for (auto &b : layout.blocks()) {
+            if (b.size == 1) continue;
+            if ((dim_t)b.stride != inner) break;
+            inner *= b.size;
+        }
+        const dim_t outer = layout.elems() / inner;
+        if (inner % packing != 0) return false;
+        if (outer > 1 && inner % (4 * packing) != 0) return false;
+        return true;
+    };
+    VDISPATCH_REORDER(packed_store_ok(cfg->dst_layout().user()),
+            VERBOSE_UNSUPPORTED_TENSOR_LAYOUT, "dst");
     VDISPATCH_REORDER_SC(
             init_kernel_info(), "kernel initialization unsuccessful");
     VDISPATCH_REORDER_SC(maybe_create_zp_precompute_conv_pd(dst_engine),
