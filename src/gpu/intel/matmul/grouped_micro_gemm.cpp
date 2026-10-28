@@ -599,6 +599,29 @@ status_t grouped_micro_gemm_t::pd_t::init_m_axis(const impl::engine_t *engine) {
                 wei_scale_mask, wei_zp_mask);
     }
 
+    // The microkernel applies scales and zero points with a single group
+    // shape per operand. Common wei zero points have no groups.
+    if (src_quant().with_scale() && src_quant().with_zp()) {
+        std::array<int, 2> src_zp_group_sizes;
+        calc_group_sizes(src_zp_group_sizes,
+                attr()->zero_points_.get(DNNL_ARG_SRC), src_d);
+        VDISPATCH_MATMUL(src_zp_group_sizes == src_group_sizes(),
+                VERBOSE_UNSUPPORTED_ZP_CFG
+                ": src scale and zp groups must match");
+    }
+    if (wei_quant().with_scale() && wei_quant().with_zp()
+            && wei_quant().zp_mask() != 0) {
+        std::array<int, 3> wei_scale_group_sizes;
+        std::array<int, 3> wei_zp_group_sizes;
+        calc_group_sizes(wei_scale_group_sizes,
+                attr()->scales_.get(DNNL_ARG_WEIGHTS), wei_d);
+        calc_group_sizes(wei_zp_group_sizes,
+                attr()->zero_points_.get(DNNL_ARG_WEIGHTS), wei_d);
+        VDISPATCH_MATMUL(wei_zp_group_sizes == wei_scale_group_sizes,
+                VERBOSE_UNSUPPORTED_ZP_CFG
+                ": wei scale and zp groups must match");
+    }
+
     return status::success;
 }
 
@@ -669,7 +692,11 @@ void init_ukernel_problem(const grouped_micro_gemm_t::pd_t &pd,
             static_cast<int>(types::elements_to_bytes(bdt, ldb))));
     problem.C.setAlignment(problem.Tc.size());
 
-    opts.scaleA = conf.with_wei_scale && conf.wei_group_k < sizes.k;
+    // Scales grouped along N need the microkernel even when a single group
+    // covers K: the per-column scales applied after the GEMM can't express
+    // them.
+    opts.scaleA = conf.with_wei_scale
+            && (conf.wei_group_k < sizes.k || conf.wei_group_n > 1);
     opts.offsetA = conf.with_wei_zp;
     opts.offsetAHostScalar = opts.offsetA && conf.wei_zp_host_scalar;
     opts.scaleB = conf.with_src_scale && conf.src_group_k < sizes.k;
