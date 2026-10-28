@@ -24,7 +24,8 @@
 //
 // The IR operation is builder-independent. `generate_kernel()` sets this object
 // up:
-//   1. Create it from the post-ops chain and the destination descriptor.
+//   1. Create it from the post-ops chain, the destination descriptor, and the
+//      IR whose `inject_postops` operations it lowers.
 //   2. Pass it to the emitter, which calls `init()` once and then `inject()`
 //      per `inject_postops` operation.
 //   3. Call `maybe_prepare_table()` once after the postamble.
@@ -59,6 +60,7 @@
 
 #include "common/c_types_map.hpp"
 #include "cpu/x64/cpu_isa_traits.hpp"
+#include "cpu/x64/ir/ir.hpp"
 #include "cpu/x64/jit_generator.hpp"
 
 namespace dnnl {
@@ -83,15 +85,18 @@ struct postops_injector_t {
     //                      destination origin pointer, used to turn an
     //                      accumulator address into its position in the
     //                      destination tensor
-    // tail_elems         - right-hand-side elements a partial (tail) load
-    //                      reads. 0 means every accumulator holds a full vector
+    // ir                 - IR whose `inject_postops` operations this object
+    //                      lowers. Their element counts give the number of
+    //                      right-hand-side elements a partial (tail) load
+    //                      reads. Every operation that is not a full vector
+    //                      must have the same count
     // eltwise_opmask     - AVX-512 opmask the eltwise injector uses as scratch
-    // binary_tail_opmask - AVX-512 opmask holding the `tail_elems` pattern for
-    //                      the binary injector
+    // binary_tail_opmask - AVX-512 opmask holding the tail pattern for the
+    //                      binary injector
     DNNL_API postops_injector_t(jit_generator_t &gen, cpu_isa_t isa,
             const post_ops_t &post_ops, const memory_desc_t &dst_md,
             const Xbyak::Reg64 &param_reg, int rhs_arg_offset,
-            dim_t dst_orig_off, int tail_elems, int eltwise_opmask,
+            dim_t dst_orig_off, const ir_t &ir, int eltwise_opmask,
             int binary_tail_opmask);
 
     postops_injector_t(const postops_injector_t &) = delete;
@@ -107,8 +112,10 @@ struct postops_injector_t {
     // `out_byte_off` give each accumulator's output address: binary reaches its
     // right-hand-side argument through it, sum reads the previous destination
     // value from it. `base_phys` is -1 for a chain that needs neither.
+    // `n_elems` is the number of valid leading elements in each accumulator,
+    // either a full vector or the tail count taken from the IR.
     void DNNL_API inject(const std::vector<int> &acc_phys, int base_phys,
-            const std::vector<dim_t> &out_byte_off);
+            const std::vector<dim_t> &out_byte_off, int n_elems);
 
     // Emit the post-ops constant table. Call once, after the postamble. Only
     // eltwise and sum post-ops have a table, so this is a no-op without one.
@@ -127,7 +134,10 @@ private:
     // and prelu to reach their right-hand-side argument, sum to read the
     // previous destination value.
     bool needs_rhs_args_ = false;
-    // Number of right-hand-side elements a tail load reads.
+    // Number of f32 elements in a full accumulator.
+    int vlen_elems_ = 0;
+    // Number of right-hand-side elements a tail load reads. 0 when every
+    // accumulator is a full vector.
     int tail_elems_ = 0;
     // AVX-512 opmask holding the `tail_elems_` pattern, written by `init()`.
     int binary_tail_opmask_ = -1;

@@ -60,8 +60,14 @@ namespace {
 //   m / k        - dimensions of matrix A (GEMV always has n = 1)
 //   lda / incy   - leading dimensions of A and stride between elements of `y`
 //   max_bs       - maximum batch size known at IR generation time
+//   trans_a      - whether A is transposed (K-major). It selects how an M
+//                  block is reduced (see `emit_m_block`)
 //   m_block      - M rows per full block
 //   k_block      - K elements reduced per K block
+//   acc_elems    - outputs one accumulator holds: 1 for non-transposed A,
+//                  where each accumulator is horizontally reduced to a single
+//                  output, and the SIMD width for transposed A, where each
+//                  accumulator holds a vector of neighboring outputs
 //   dt_sz_a/x/y  - element size in bytes of A, x, and y
 //   dt_a/x/y     - element data type of A, x, and y in memory
 //   dt_a_reg / dt_x_reg - data type of the vec vreg holding A and x. It is the
@@ -74,8 +80,12 @@ namespace {
 //   m_tail       - remaining M rows after the full blocks
 //   k_blocks     - number of full K blocks
 //   k_tail       - remaining K elements after the full blocks
+//   acc_tail     - outputs held by the last, partially filled accumulator of
+//                  the M tail. 0 when every accumulator is full
 //   mblk_*_off   - byte offset to advance A/y pointers between M blocks
 //   kblk_*_off   - byte offset to advance A/x pointers between K blocks
+//   pf_*_off     - byte distance along K at which A/x are SW-prefetched ahead
+//                  of their loads. 0 disables the prefetch
 //   with_bias    - whether a bias is added to the output
 //   treat_y_as_row - whether the output y is a row. When true the bias is
 //                    indexed per M row, otherwise broadcast from bias[0]
@@ -101,8 +111,10 @@ struct brgemv_ir_conf_t {
         , lda(brg.LDA)
         , incy(brg.LDC)
         , max_bs(brg.brgattr.max_bs)
-        , m_block(brg.gemv_bd_block())
+        , trans_a(brg.transA)
+        , m_block(brg.bd_block)
         , k_block(brg.rd_block)
+        , acc_elems(trans_a ? m_block / brg.gemv_bd_block() : 1)
         , dt_sz_a(brg.typesize_A)
         , dt_sz_x(brg.typesize_B)
         , dt_sz_y(brg.typesize_C)
@@ -117,10 +129,18 @@ struct brgemv_ir_conf_t {
         , m_tail(m % m_block)
         , k_blocks(k / k_block)
         , k_tail(k % k_block)
-        , mblk_a_off(dt_sz_a * m_block * lda)
+        , acc_tail((int)(m_tail % acc_elems))
+        // A is K-major when it is transposed, so the next M block is `m_block`
+        // contiguous elements away and the next K block is `k_block` rows
+        // away. Otherwise it is the other way around.
+        , mblk_a_off(trans_a ? dt_sz_a * (dim_t)m_block
+                             : dt_sz_a * (dim_t)m_block * lda)
         , mblk_y_off(dt_sz_y * m_block * incy)
-        , kblk_a_off(dt_sz_a * k_block)
+        , kblk_a_off(trans_a ? dt_sz_a * (dim_t)k_block * lda
+                             : dt_sz_a * (dim_t)k_block)
         , kblk_x_off(dt_sz_x * k_block)
+        , pf_a_off(brg.gemv_pf_rd_blocks() * kblk_a_off)
+        , pf_x_off(brg.gemv_pf_rd_blocks() * kblk_x_off)
         , with_bias(brg.with_bias)
         , treat_y_as_row(brg.treat_y_as_row)
         , dt_bias(brg.dt_bias)
@@ -140,15 +160,18 @@ struct brgemv_ir_conf_t {
 
     const dim_t m, k, lda, incy;
     const dim_t max_bs;
-    const int m_block, k_block;
+    const bool trans_a;
+    const int m_block, k_block, acc_elems;
     const int dt_sz_a, dt_sz_x, dt_sz_y;
     const data_type_t dt_a, dt_x, dt_y;
     const data_type_t dt_a_reg, dt_x_reg;
     const data_type_t dt_acc;
     const float beta;
     const dim_t m_blocks, m_tail, k_blocks, k_tail;
+    const int acc_tail;
     const dim_t mblk_a_off, mblk_y_off;
     const dim_t kblk_a_off, kblk_x_off;
+    const dim_t pf_a_off, pf_x_off;
     const bool with_bias, treat_y_as_row;
     const data_type_t dt_bias;
     const int dt_sz_bias;
@@ -211,6 +234,10 @@ struct invariant_regs_t {
     // K-tail mask, shared by every masked tail load. `none` when `k_tail` is
     // zero, which is when there is no tail load to mask.
     ir::vreg_t k_tail_mask = ir::vreg_t::none;
+    // Mask of the partially filled accumulator, holding `acc_tail` active
+    // elements. Shared by every masked access to its outputs and to its slice
+    // of A. `none` when `acc_tail` is zero.
+    ir::vreg_t acc_tail_mask = ir::vreg_t::none;
     // Post-ops flag (params.do_post_ops). Non-zero applies the post-ops, zero
     // stores the raw accumulator. `none` unless the kernel has a post-op to
     // apply (bias, scales, or injector post-ops).
@@ -259,6 +286,11 @@ m_loop_input_regs_t init_m_loop_input_regs(
         ir.set_mask_imm(regs.invariant.k_tail_mask, (int)cfg.k_tail);
     }
 
+    if (cfg.acc_tail > 0) {
+        regs.invariant.acc_tail_mask = ir.new_mask();
+        ir.set_mask_imm(regs.invariant.acc_tail_mask, cfg.acc_tail);
+    }
+
     if (cfg.with_bias) {
         regs.advancing.bias_ptr = ir.new_gpr();
         ir.load_param(regs.advancing.bias_ptr, GET_OFF(ptr_bias));
@@ -292,6 +324,205 @@ m_loop_input_regs_t init_m_loop_input_regs(
     return regs;
 }
 
+// An accumulator and the number of outputs it holds.
+//
+// Accumulator `r` of an M block covers the `n_elems` outputs starting at
+// output `r * acc_elems` of the block. Only the last accumulator of the M tail
+// can hold fewer than `acc_elems` outputs.
+struct acc_t {
+    ir::vreg_t reg = ir::vreg_t::none;
+    int n_elems = 0;
+};
+
+// Byte offset of the first output of accumulator `r` from the start of the
+// current M block, in a buffer of output-shaped elements of `dt_sz` bytes
+// placed `inc` elements apart.
+dim_t acc_off(const brgemv_ir_conf_t &cfg, int r, int dt_sz, dim_t inc = 1) {
+    return dt_sz * (dim_t)r * cfg.acc_elems * inc;
+}
+
+// Loads the elements of an output-shaped operand (`y` or a per-output bias or
+// scale) that match an accumulator holding `n_elems` outputs. A single output
+// needs only element 0, and a partially filled accumulator is read under the
+// accumulator-tail mask.
+void emit_acc_load(ir::ir_t &ir, const brgemv_ir_conf_t &cfg,
+        const m_loop_input_regs_t &regs, ir::vreg_t dst, ir::vreg_t base,
+        dim_t disp, int n_elems, data_type_t mem_dt) {
+    if (n_elems == 1)
+        ir.vload_scalar(dst, base, disp, mem_dt);
+    else if (n_elems == cfg.acc_elems)
+        ir.vload(dst, base, disp, mem_dt);
+    else
+        ir.vload_masked(dst, base, disp, regs.invariant.acc_tail_mask, mem_dt);
+}
+
+// Stores the `n_elems` outputs an accumulator holds. The counterpart of
+// `emit_acc_load`.
+void emit_acc_store(ir::ir_t &ir, const brgemv_ir_conf_t &cfg,
+        const m_loop_input_regs_t &regs, ir::vreg_t base, dim_t disp,
+        ir::vreg_t src, int n_elems, data_type_t mem_dt) {
+    if (n_elems == 1)
+        ir.vstore_scalar(base, disp, src, mem_dt);
+    else if (n_elems == cfg.acc_elems)
+        ir.vstore(base, disp, src, mem_dt);
+    else
+        ir.vstore_masked(base, disp, src, regs.invariant.acc_tail_mask, mem_dt);
+}
+
+// Loads a value shared by every output into the first `n_elems` elements of
+// `dst`. A single output needs only element 0, which a plain load fills.
+void emit_bcast_load(ir::ir_t &ir, ir::vreg_t dst, ir::vreg_t base, dim_t disp,
+        int n_elems, data_type_t mem_dt) {
+    if (n_elems == 1)
+        ir.vload_scalar(dst, base, disp, mem_dt);
+    else
+        ir.vload_bcast(dst, base, disp, mem_dt);
+}
+
+// Creates the accumulators of an M block covering `rows` outputs and seeds
+// them as `beta` requires.
+std::vector<acc_t> init_accumulators(ir::ir_t &ir, const brgemv_ir_conf_t &cfg,
+        const m_loop_input_regs_t &regs, int rows) {
+    std::vector<acc_t> acc(utils::div_up(rows, cfg.acc_elems));
+    for (int r = 0; r < (int)acc.size(); r++) {
+        acc[r].reg = ir.new_vec(cfg.dt_acc);
+        acc[r].n_elems = nstl::min(cfg.acc_elems, rows - r * cfg.acc_elems);
+
+        // The current implementation supports only 0 and 1 for beta so for the
+        // case where beta = 1 we load `y` into the accumulator registers and
+        // then the reduction adds the results of the multiplication to them.
+        //
+        // This reads `y_ptr` while a sum post-op reads `store_ptr`, so the two
+        // never count the same value twice.
+        if (cfg.beta == 0.0f)
+            ir.vzero(acc[r].reg);
+        else
+            emit_acc_load(ir, cfg, regs, acc[r].reg, regs.advancing.y_ptr,
+                    acc_off(cfg, r, cfg.dt_sz_y, cfg.incy), acc[r].n_elems,
+                    cfg.dt_y);
+    }
+    return acc;
+}
+
+// Batch loop of an M block.
+//
+// For each batch element, loads its A and x pointers, moves A to the current
+// M block and calls `body(a_ptr, x_ptr)` to reduce the element into the
+// accumulators.
+template <typename body_t>
+void emit_batch_loop(ir::ir_t &ir, const brgemv_ir_conf_t &cfg,
+        const m_loop_input_regs_t &regs, body_t body) {
+    const ir::vreg_t batch_ptr = ir.new_gpr();
+    ir.mov_reg(batch_ptr, regs.invariant.batch);
+
+    auto bs_body = [&]() {
+        const ir::vreg_t a_ptr = ir.new_gpr();
+        const ir::vreg_t x_ptr = ir.new_gpr();
+
+        ir.load(a_ptr, batch_ptr, GET_OFF_BATCH_ELEMENT(ptr.A));
+        ir.add_reg(a_ptr, regs.advancing.a_off);
+        ir.load(x_ptr, batch_ptr, GET_OFF_BATCH_ELEMENT(ptr.B));
+        ir.add_imm(batch_ptr, sizeof(brgemm_batch_element_t));
+
+        body(a_ptr, x_ptr);
+    };
+
+    if (cfg.max_bs > 1)
+        ir::emit_loop_reg(ir, regs.invariant.bs, bs_body);
+    else
+        ir::emit_loop_imm(ir, 1, bs_body);
+}
+
+// Post-ops of an M block.
+//
+// Applies scales, bias and injector post-ops in place to the reduced
+// accumulators.
+void emit_post_ops(ir::ir_t &ir, const brgemv_ir_conf_t &cfg,
+        const m_loop_input_regs_t &regs, const std::vector<acc_t> &acc) {
+    if (!cfg.has_post_ops()) return;
+
+    const int n_acc = (int)acc.size();
+    // No accumulator holds more outputs than the first, so a shared value
+    // broadcast to that many elements covers every accumulator.
+    const int bcast_elems = acc[0].n_elems;
+
+    // The implemented order conforms to oneDNN's defined semantics for
+    // applying scales, bias and post-ops:
+    //   src scale -> weights scale -> bias -> post-ops.
+    // Scales apply to the accumulated result before the bias add and
+    // post-ops apply after bias. The two scales can swap because both are
+    // multiplies but a scale must not move past the bias and the bias must
+    // not move past the post-ops.
+    const int if_post_ops
+            = ir.if_begin(regs.invariant.do_post_ops, ir::cmp_t::ne, 0);
+
+    if (cfg.with_src_scales) {
+        // Loaded once and applied to every output.
+        const ir::vreg_t sc = ir.new_vec(cfg.dt_src_scales);
+        emit_bcast_load(ir, sc, regs.invariant.src_scale_ptr, 0, bcast_elems,
+                cfg.dt_src_scales);
+
+        for (int r = 0; r < n_acc; r++)
+            ir.vmul(acc[r].reg, sc);
+    }
+
+    if (cfg.with_wei_scales) {
+        // The single scale is loop invariant, so load it once above the
+        // loop. The per-N case loads a separate scale per output element.
+        const ir::vreg_t sc = ir.new_vec(cfg.dt_wei_scales);
+        if (cfg.single_wei_scale)
+            emit_bcast_load(ir, sc, regs.advancing.wei_scale_ptr, 0,
+                    bcast_elems, cfg.dt_wei_scales);
+
+        for (int r = 0; r < n_acc; r++) {
+            if (!cfg.single_wei_scale)
+                emit_acc_load(ir, cfg, regs, sc, regs.advancing.wei_scale_ptr,
+                        acc_off(cfg, r, cfg.dt_sz_wei_scales), acc[r].n_elems,
+                        cfg.dt_wei_scales);
+            ir.vmul(acc[r].reg, sc);
+        }
+    }
+
+    if (cfg.with_bias) {
+        // The broadcast bias is loop invariant, so load it once outside the
+        // loop. A row output loads a separate bias per output element.
+        const ir::vreg_t bias = ir.new_vec(cfg.dt_bias);
+        if (!cfg.treat_y_as_row)
+            emit_bcast_load(ir, bias, regs.advancing.bias_ptr, 0, bcast_elems,
+                    cfg.dt_bias);
+
+        for (int r = 0; r < n_acc; r++) {
+            if (cfg.treat_y_as_row)
+                emit_acc_load(ir, cfg, regs, bias, regs.advancing.bias_ptr,
+                        acc_off(cfg, r, cfg.dt_sz_bias), acc[r].n_elems,
+                        cfg.dt_bias);
+            ir.vadd(acc[r].reg, bias);
+        }
+    }
+
+    if (cfg.with_injector_postops) {
+        // One `inject_postops` operation takes a single valid-element count,
+        // so each run of accumulators that hold the same number of outputs
+        // goes into its own operation. The output offsets match the store
+        // displacements in `emit_m_block`, so a sum post-op reads each element
+        // from the address its result is written to.
+        for (int beg = 0; beg < n_acc;) {
+            std::vector<ir::vreg_t> run_acc;
+            std::vector<dim_t> run_off;
+            int end = beg;
+            for (; end < n_acc && acc[end].n_elems == acc[beg].n_elems; end++) {
+                run_acc.push_back(acc[end].reg);
+                run_off.push_back(acc_off(cfg, end, cfg.dt_sz_y, cfg.incy));
+            }
+            ir.inject_postops(run_acc, regs.advancing.store_ptr, run_off,
+                    acc[beg].n_elems);
+            beg = end;
+        }
+    }
+
+    ir.if_end(if_post_ops);
+}
+
 } // namespace
 
 namespace nontrans {
@@ -304,21 +535,18 @@ namespace nontrans {
 // Each accumulator holds a partial dot product for one output. The number of
 // accumulators is the number of rows in the current M block or M tail.
 void emit_microkernel(ir::ir_t &ir, const brgemv_ir_conf_t &cfg,
-        const std::vector<ir::vreg_t> &acc, ir::vreg_t a_ptr,
-        ir::vreg_t x_ptr) {
+        const std::vector<acc_t> &acc, ir::vreg_t a_ptr, ir::vreg_t x_ptr) {
     // GEMV is bandwidth-bound, so SW-prefetch ahead of each load: the x vector
-    // once and every A row. The distance is empirically tuned.
-    constexpr dim_t gemv_pf_dist = 512; // bytes = 8 cache lines
-
+    // once and every A row.
     const ir::vreg_t x = ir.new_vec(cfg.dt_x_reg);
     const ir::vreg_t a = ir.new_vec(cfg.dt_a_reg);
-    ir.prefetch(x_ptr, gemv_pf_dist);
+    if (cfg.pf_x_off > 0) ir.prefetch(x_ptr, cfg.pf_x_off);
     ir.vload(x, x_ptr, 0, cfg.dt_x);
     for (int i = 0; i < (int)acc.size(); i++) {
         const dim_t a_off = cfg.dt_sz_a * (dim_t)i * cfg.lda;
-        ir.prefetch(a_ptr, a_off + gemv_pf_dist);
+        if (cfg.pf_a_off > 0) ir.prefetch(a_ptr, a_off + cfg.pf_a_off);
         ir.vload(a, a_ptr, a_off, cfg.dt_a);
-        ir.vdot(acc[i], a, x);
+        ir.vdot(acc[i].reg, a, x);
     }
 }
 
@@ -326,7 +554,7 @@ void emit_microkernel(ir::ir_t &ir, const brgemv_ir_conf_t &cfg,
 //
 // Same shape as emit_microkernel, but uses masked loads.
 void emit_microkernel_tail(ir::ir_t &ir, const brgemv_ir_conf_t &cfg,
-        const std::vector<ir::vreg_t> &acc, ir::vreg_t a_ptr, ir::vreg_t x_ptr,
+        const std::vector<acc_t> &acc, ir::vreg_t a_ptr, ir::vreg_t x_ptr,
         ir::vreg_t mask) {
     const ir::vreg_t x = ir.new_vec(cfg.dt_x_reg);
     const ir::vreg_t a = ir.new_vec(cfg.dt_a_reg);
@@ -334,165 +562,126 @@ void emit_microkernel_tail(ir::ir_t &ir, const brgemv_ir_conf_t &cfg,
     for (int i = 0; i < (int)acc.size(); i++) {
         ir.vload_masked(
                 a, a_ptr, cfg.dt_sz_a * (dim_t)i * cfg.lda, mask, cfg.dt_a);
-        ir.vdot(acc[i], a, x);
+        ir.vdot(acc[i].reg, a, x);
     }
 }
 
-// One batch element.
+// Reduction of one M block with a non-transposed A.
 //
-// Loads A and x pointers, then runs the reduction loop over k.
-// Each iteration processes one `k_block` chunk and advances the pointers.
-void emit_bs_body(ir::ir_t &ir, const brgemv_ir_conf_t &cfg,
-        const std::vector<ir::vreg_t> &acc, ir::vreg_t batch_ptr,
-        ir::vreg_t a_off, ir::vreg_t k_tail_mask) {
-    const ir::vreg_t a_ptr = ir.new_gpr();
-    const ir::vreg_t x_ptr = ir.new_gpr();
+// Each accumulator holds the dot product of one A row with x. The rows are
+// read in k_block-wide chunks across the batch, and each accumulator is then
+// horizontally reduced to the single output it holds.
+void emit_reduce(ir::ir_t &ir, const brgemv_ir_conf_t &cfg,
+        const m_loop_input_regs_t &regs, const std::vector<acc_t> &acc) {
+    emit_batch_loop(ir, cfg, regs, [&](ir::vreg_t a_ptr, ir::vreg_t x_ptr) {
+        // Advance the A and x pointers by one K block.
+        auto advance_ptrs = [&]() {
+            ir.add_imm(a_ptr, cfg.kblk_a_off);
+            ir.add_imm(x_ptr, cfg.kblk_x_off);
+        };
 
-    ir.load(a_ptr, batch_ptr, GET_OFF_BATCH_ELEMENT(ptr.A));
-    ir.add_reg(a_ptr, a_off);
-    ir.load(x_ptr, batch_ptr, GET_OFF_BATCH_ELEMENT(ptr.B));
-    ir.add_imm(batch_ptr, sizeof(brgemm_batch_element_t));
-
-    // Advance the A and x pointers by one K block.
-    auto advance_ptrs = [&]() {
-        ir.add_imm(a_ptr, cfg.kblk_a_off);
-        ir.add_imm(x_ptr, cfg.kblk_x_off);
-    };
-
-    // Reduce the full K blocks, then the tail if any. Cases by `k_blocks`.
-    // k > 0 guarantees k_blocks and k_tail are never both zero.
-    //   *  == 0  whole reduction is the tail
-    //   *  == 1  one block, advance by hand only if a tail follows
-    //   *  >= 2  loop, advancing per iteration
-    if (cfg.k_blocks >= 2) {
-        ir::emit_loop_imm(ir, cfg.k_blocks, [&]() {
+        // Reduce the full K blocks, then the tail if any. Cases by `k_blocks`.
+        // k > 0 guarantees k_blocks and k_tail are never both zero.
+        //   *  == 0  whole reduction is the tail
+        //   *  == 1  one block, advance by hand only if a tail follows
+        //   *  >= 2  loop, advancing per iteration
+        if (cfg.k_blocks >= 2) {
+            ir::emit_loop_imm(ir, cfg.k_blocks, [&]() {
+                emit_microkernel(ir, cfg, acc, a_ptr, x_ptr);
+            }, advance_ptrs);
+        } else if (cfg.k_blocks == 1) {
             emit_microkernel(ir, cfg, acc, a_ptr, x_ptr);
-        }, advance_ptrs);
-    } else if (cfg.k_blocks == 1) {
-        emit_microkernel(ir, cfg, acc, a_ptr, x_ptr);
-        if (cfg.k_tail > 0) advance_ptrs();
-    }
-    if (cfg.k_tail > 0)
-        emit_microkernel_tail(ir, cfg, acc, a_ptr, x_ptr, k_tail_mask);
+            if (cfg.k_tail > 0) advance_ptrs();
+        }
+        if (cfg.k_tail > 0)
+            emit_microkernel_tail(
+                    ir, cfg, acc, a_ptr, x_ptr, regs.invariant.k_tail_mask);
+    });
+
+    // Horizontal reduction
+    const ir::vreg_t ws = ir.new_vec(cfg.dt_acc);
+    for (int r = 0; r < (int)acc.size(); r++)
+        ir.vhreduce(acc[r].reg, ws);
 }
 
-// One M block.
-//
-// Contains `m_block` independent accumulators, reduced across the batch.
-// They are then horizontally reduced to a single scalar each and stored.
-//
-// Finally, advances the A and x pointers to the next M block.
-void emit_m_block(ir::ir_t &ir, const brgemv_ir_conf_t &cfg,
-        const m_loop_input_regs_t &regs, int m_block) {
-    std::vector<ir::vreg_t> acc(m_block, ir::vreg_t::none);
-    for (int r = 0; r < m_block; r++) {
-        acc[r] = ir.new_vec(cfg.dt_acc);
+} // namespace nontrans
 
-        // The current implementation supports only 0 and 1 for beta so for the
-        // case where beta = 1 we load `y` into the accumulator registers and
-        // then the microkernel adds the results of the multiplication to them.
-        //
-        // This reads `y_ptr` while a sum post-op reads `store_ptr`, so the two
-        // never count the same value twice.
-        if (cfg.beta == 0.0f)
-            ir.vzero(acc[r]);
+namespace trans {
+
+// Innermost reduction step.
+//
+// Broadcasts one element of `x`, then performs a multiply-add into every
+// accumulator using the matching slice of the current A row.
+//
+// A is K-major here, so a single K step reads one contiguous A row that spans
+// the whole M block. Each accumulator takes the `n_elems` elements of the row
+// that match its outputs.
+void emit_microkernel(ir::ir_t &ir, const brgemv_ir_conf_t &cfg,
+        const m_loop_input_regs_t &regs, const std::vector<acc_t> &acc,
+        ir::vreg_t a_ptr, ir::vreg_t x_ptr) {
+    const ir::vreg_t x = ir.new_vec(cfg.dt_x_reg);
+    const ir::vreg_t a = ir.new_vec(cfg.dt_a_reg);
+    ir.vload_bcast(x, x_ptr, 0, cfg.dt_x);
+    for (int r = 0; r < (int)acc.size(); r++) {
+        const dim_t a_off = acc_off(cfg, r, cfg.dt_sz_a);
+        if (cfg.pf_a_off > 0) ir.prefetch(a_ptr, a_off + cfg.pf_a_off);
+        if (acc[r].n_elems == cfg.acc_elems)
+            ir.vload(a, a_ptr, a_off, cfg.dt_a);
         else
-            ir.vload_scalar(acc[r], regs.advancing.y_ptr,
-                    cfg.dt_sz_y * (dim_t)r * cfg.incy, cfg.dt_y);
+            ir.vload_masked(
+                    a, a_ptr, a_off, regs.invariant.acc_tail_mask, cfg.dt_a);
+        ir.vdot(acc[r].reg, a, x);
     }
+}
 
-    // Batch reduction over bs dimension
-    const ir::vreg_t batch_ptr = ir.new_gpr();
-    ir.mov_reg(batch_ptr, regs.invariant.batch);
+// Reduction of one M block with a transposed A.
+//
+// Each accumulator holds `acc_elems` neighboring outputs. K is reduced one A
+// row at a time across the batch, multiplying the row by a broadcast element
+// of x. The outputs already sit in the elements they are stored from, so
+// nothing is reduced horizontally.
+void emit_reduce(ir::ir_t &ir, const brgemv_ir_conf_t &cfg,
+        const m_loop_input_regs_t &regs, const std::vector<acc_t> &acc) {
+    // The transA blocking reduces one A row per K step (see
+    // `brgemm_blocking_vmm_gemv`), so there is no K tail.
+    assert(cfg.k_block == 1 && cfg.k_tail == 0);
 
-    if (cfg.max_bs > 1) {
-        ir::emit_loop_reg(ir, regs.invariant.bs, [&]() {
-            emit_bs_body(ir, cfg, acc, batch_ptr, regs.advancing.a_off,
-                    regs.invariant.k_tail_mask);
+    emit_batch_loop(ir, cfg, regs, [&](ir::vreg_t a_ptr, ir::vreg_t x_ptr) {
+        ir::emit_loop_imm(ir, cfg.k_blocks, [&]() {
+            emit_microkernel(ir, cfg, regs, acc, a_ptr, x_ptr);
+        }, [&]() {
+            ir.add_imm(a_ptr, cfg.kblk_a_off);
+            ir.add_imm(x_ptr, cfg.kblk_x_off);
         });
-    } else {
-        ir::emit_loop_imm(ir, 1, [&]() {
-            emit_bs_body(ir, cfg, acc, batch_ptr, regs.advancing.a_off,
-                    regs.invariant.k_tail_mask);
-        });
-    }
+    });
+}
 
-    // Horizontal reduction + store
-    const ir::vreg_t ws = ir.new_vec(cfg.dt_acc);
-    for (int r = 0; r < m_block; r++)
-        ir.vhreduce(acc[r], ws);
+} // namespace trans
 
-    if (cfg.has_post_ops()) {
-        // The implemented order conforms to oneDNN's defined semantics for
-        // applying scales, bias and post-ops:
-        //   src scale -> weights scale -> bias -> post-ops.
-        // Scales apply to the accumulated result before the bias add and
-        // post-ops apply after bias. The two scales can swap because both are
-        // multiplies but a scale must not move past the bias and the bias must
-        // not move past the post-ops.
-        const int if_post_ops
-                = ir.if_begin(regs.invariant.do_post_ops, ir::cmp_t::ne, 0);
+namespace {
 
-        if (cfg.with_src_scales) {
-            // Loaded once and applied to every output.
-            const ir::vreg_t sc = ir.new_vec(cfg.dt_src_scales);
-            ir.vload_scalar(
-                    sc, regs.invariant.src_scale_ptr, 0, cfg.dt_src_scales);
+// One M block covering `rows` outputs.
+//
+// Reduces the block into its accumulators, applies the post-ops and stores the
+// result. Finally, advances the M-block pointers to the next block.
+void emit_m_block(ir::ir_t &ir, const brgemv_ir_conf_t &cfg,
+        const m_loop_input_regs_t &regs, int rows) {
+    const std::vector<acc_t> acc = init_accumulators(ir, cfg, regs, rows);
 
-            for (int r = 0; r < m_block; r++)
-                ir.vmul(acc[r], sc);
-        }
+    // The layout of A only decides how the block is reduced. Everything else
+    // is shared and sees the layout only as how many outputs each accumulator
+    // holds.
+    if (cfg.trans_a)
+        trans::emit_reduce(ir, cfg, regs, acc);
+    else
+        nontrans::emit_reduce(ir, cfg, regs, acc);
 
-        if (cfg.with_wei_scales) {
-            // The single scale is loop invariant, so load it once above the
-            // loop. The per-N case loads a separate scale per output element.
-            const ir::vreg_t sc = ir.new_vec(cfg.dt_wei_scales);
-            if (cfg.single_wei_scale)
-                ir.vload_scalar(
-                        sc, regs.advancing.wei_scale_ptr, 0, cfg.dt_wei_scales);
+    emit_post_ops(ir, cfg, regs, acc);
 
-            for (int r = 0; r < m_block; r++) {
-                if (!cfg.single_wei_scale)
-                    ir.vload_scalar(sc, regs.advancing.wei_scale_ptr,
-                            cfg.dt_sz_wei_scales * (dim_t)r, cfg.dt_wei_scales);
-                ir.vmul(acc[r], sc);
-            }
-        }
-
-        if (cfg.with_bias) {
-            // The broadcast bias is loop invariant, so load it once outside the
-            // loop. A row output loads a separate bias per output element.
-            const ir::vreg_t bias = ir.new_vec(cfg.dt_bias);
-            if (!cfg.treat_y_as_row)
-                ir.vload_scalar(bias, regs.advancing.bias_ptr, 0, cfg.dt_bias);
-
-            for (int r = 0; r < m_block; r++) {
-                if (cfg.treat_y_as_row)
-                    ir.vload_scalar(bias, regs.advancing.bias_ptr,
-                            cfg.dt_sz_bias * (dim_t)r, cfg.dt_bias);
-                ir.vadd(acc[r], bias);
-            }
-        }
-
-        if (cfg.with_injector_postops) {
-            // Each accumulator is horizontally reduced to one scalar, which is
-            // the active element count `generate()` gives the injector. The
-            // output offset matches the store displacement below, so a sum
-            // post-op reads each element from the address its result is
-            // written to.
-            std::vector<dim_t> out_byte_off(m_block);
-            for (int r = 0; r < m_block; r++)
-                out_byte_off[r] = cfg.dt_sz_y * (dim_t)r * cfg.incy;
-
-            ir.inject_postops(acc, regs.advancing.store_ptr, out_byte_off);
-        }
-
-        ir.if_end(if_post_ops);
-    }
-
-    for (int r = 0; r < m_block; r++)
-        ir.vstore_scalar(regs.advancing.store_ptr,
-                cfg.dt_sz_y * (dim_t)r * cfg.incy, acc[r], cfg.dt_y);
+    for (int r = 0; r < (int)acc.size(); r++)
+        emit_acc_store(ir, cfg, regs, regs.advancing.store_ptr,
+                acc_off(cfg, r, cfg.dt_sz_y, cfg.incy), acc[r].reg,
+                acc[r].n_elems, cfg.dt_y);
 
     // Advance to next M block
     ir.add_imm(regs.advancing.a_off, cfg.mblk_a_off);
@@ -508,20 +697,24 @@ void emit_m_block(ir::ir_t &ir, const brgemv_ir_conf_t &cfg,
         ir.add_imm(regs.advancing.wei_scale_ptr, cfg.mblk_wei_scale_off);
 }
 
-// Builds IR for GEMV with a non-transposed A matrix.
+// Builds IR for GEMV.
 //
 // Computes:
-//   y[i] = sum_k A[i][k] * x[k]
+//   y[i] = sum_k A[i][k] * x[k]    (non-transposed A)
+//   y[i] = sum_k A[k][i] * x[k]    (transposed A)
 //   (m = brg.bcast_dim, k = brg.reduce_dim, n = 1)
 //
 // The output is partitioned into full M blocks of `m_block` rows each, with a
 // final partial block of `m_tail` rows when m is not a multiple of m_block.
 //
 // Each M block:
-// - Maintains one independent accumulator per row
-// - Accumulates over k in k_block-wide chunks across the batch
-// - Horizontally reduces each accumulator to a scalar output value
-//   and stores it to memory
+// - Maintains one accumulator per `acc_elems` neighboring outputs
+// - Accumulates over k across the batch:
+//   - non-transposed A: in k_block-wide chunks of each A row, then
+//     horizontally reduces each accumulator to its single output
+//   - transposed A: one A row at a time, multiplied by a broadcast element of
+//     x
+// - Applies the post-ops and stores the accumulators to memory
 void build_gemv(const brgemm_desc_t &brg, ir::ir_t &ir) {
     const brgemv_ir_conf_t cfg(brg);
     const m_loop_input_regs_t regs = init_m_loop_input_regs(ir, cfg);
@@ -533,10 +726,6 @@ void build_gemv(const brgemm_desc_t &brg, ir::ir_t &ir) {
     if (cfg.m_tail > 0) emit_m_block(ir, cfg, regs, (int)cfg.m_tail);
 }
 
-} // namespace nontrans
-
-namespace {
-
 // IR-based BRGEMV kernel.
 struct jit_brgemv_ir_kernel_t : public brgemm_kernel_t {
     DECLARE_CPU_JIT_AUX_FUNCTIONS(jit_brgemv_ir_kernel_t)
@@ -546,7 +735,7 @@ struct jit_brgemv_ir_kernel_t : public brgemm_kernel_t {
 
     void generate() override {
         ir::ir_t ir;
-        nontrans::build_gemv(brg_, ir);
+        build_gemv(brg_, ir);
 
         ir::postops_config_t postops;
         if (brg_.with_eltwise || brg_.with_binary || brg_.with_sum) {
@@ -554,9 +743,6 @@ struct jit_brgemv_ir_kernel_t : public brgemm_kernel_t {
             postops.dst_md = brg_.dst_md();
             postops.rhs_arg_offset = GET_OFF(post_ops_binary_rhs_arg_vec);
             postops.dst_orig_off = GET_OFF(data_C_ptr_);
-            // A partial right-hand-side load reads the vector tail, or one
-            // element for a scalar accumulator.
-            postops.tail_elems = brg_.gemv_acc_is_vector() ? brg_.gemv_tail : 1;
         }
 
         ir::generate_kernel(*this, ir, postops);
@@ -585,8 +771,6 @@ status_t brgemv_ir_supported(const brgemm_desc_t &brg) {
     VCONDCHECK_BRGEMV_IR(brg.dt_b == brg.dt_a, VERBOSE_UNSUPPORTED_DT);
     // The kernel accumulates in f32 and has no conversion on the way out.
     VCONDCHECK_BRGEMV_IR(brg.dt_c == f32, VERBOSE_UNSUPPORTED_DT);
-    VCONDCHECK_BRGEMV_IR(
-            !brg.transA, VERBOSE_UNSUPPORTED_FEATURE, "transposed A");
 
     // With post-ops the kernel stores to D instead of C. It cannot convert the
     // accumulator on the way out, so it takes only `dt_d == dt_c`. The check is
@@ -645,18 +829,25 @@ status_t brgemv_ir_supported(const brgemm_desc_t &brg) {
     VCONDCHECK_BRGEMV_IR(
             !brg.is_runtime_ldc, VERBOSE_UNSUPPORTED_FEATURE, "runtime ldc");
 
-    const int m_block = brg.gemv_bd_block();
-    const int dt_sz_a = brg.typesize_A;
-    const int dt_sz_y = brg.typesize_C;
-    const dim_t incy = brg.LDC;
+    const brgemv_ir_conf_t cfg(brg);
+
+    // With a transposed A each accumulator holds a vector of neighboring
+    // outputs and stores them with a single instruction, so `y` has to be
+    // contiguous.
+    VCONDCHECK_BRGEMV_IR(IMPLICATION(cfg.trans_a, cfg.incy == 1),
+            VERBOSE_UNSUPPORTED_FEATURE, "strided y with transposed A");
 
     // Ensure indexed displacements fit in 32-bit
     auto fits = [](dim_t v) { return v <= INT32_MAX && v >= INT32_MIN; };
 
-    VCONDCHECK_BRGEMV_IR(fits(dt_sz_a * (dim_t)m_block * brg.LDA),
+    // Every A displacement inside an M block, prefetch included, is below the
+    // block offset plus the prefetch distance.
+    VCONDCHECK_BRGEMV_IR(fits(cfg.mblk_a_off + cfg.pf_a_off),
             VERBOSE_UNSUPPORTED_FEATURE, "A block offset overflows int32");
-    VCONDCHECK_BRGEMV_IR(fits(dt_sz_y * (dim_t)m_block * incy),
-            VERBOSE_UNSUPPORTED_FEATURE, "y block offset overflows int32");
+    VCONDCHECK_BRGEMV_IR(fits(cfg.kblk_a_off), VERBOSE_UNSUPPORTED_FEATURE,
+            "A reduction step overflows int32");
+    VCONDCHECK_BRGEMV_IR(fits(cfg.mblk_y_off), VERBOSE_UNSUPPORTED_FEATURE,
+            "y block offset overflows int32");
 
     return status::success;
 }
