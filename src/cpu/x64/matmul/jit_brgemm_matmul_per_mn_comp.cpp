@@ -82,6 +82,10 @@ struct jit_per_mn_comp_kernel_t : public per_mn_comp_kernel_t,
         , src_k_stride_bytes_(bgmmc->A_strides[0])
         , wei_k_stride_bytes_(wei_is_subbyte_ ? bgmmc->B_strides[1] / 2
                                               : bgmmc->B_strides[1])
+        , wei_is_blocked_(bgmmc->blocked_B)
+        , wei_n_blk_(bgmmc->wei_n_blk)
+        , wei_n_blk_stride_bytes_(wei_is_subbyte_ ? bgmmc->B_strides[0] / 2
+                                                  : bgmmc->B_strides[0])
         , LDC_(bgmmc->LDC)
         , n_blk_w_(static_cast<int>(nstl::min<dim_t>(bgmmc->LDC, bgmmc->N_blk)))
         , n_tail_w_(bgmmc->N_tail > 0 ? static_cast<int>(nstl::min<dim_t>(
@@ -113,6 +117,10 @@ private:
     const dim_t src_m_stride_bytes_;
     const dim_t src_k_stride_bytes_;
     const dim_t wei_k_stride_bytes_;
+    // VNNI-blocked weights: [n / wei_n_blk][k / vnni][wei_n_blk][vnni].
+    const bool wei_is_blocked_;
+    const dim_t wei_n_blk_;
+    const dim_t wei_n_blk_stride_bytes_;
     const dim_t LDC_;
     const int n_blk_w_; // full block width  = min(LDC, N_blk)
     const int n_tail_w_; // N-tail block width = min(LDC, N_tail), 0 if none
@@ -124,6 +132,8 @@ private:
     static constexpr int simd_w = vreg_traits_t<Vmm>::vlen / i32_sz;
     static constexpr int vmm_bytes = vreg_traits_t<Vmm>::vlen;
     static constexpr bool is_zmm = std::is_same<Vmm, Xbyak::Zmm>::value;
+    // K rows per VNNI group of blocked weights (int8 VNNI granularity).
+    static constexpr int blocked_vnni = 4;
 
     reg64_t reg_param = abi_param1;
 
@@ -400,6 +410,10 @@ private:
 
     // Phase B: S-reduce (vectorized integer, then convert to f32)
     void emit_s_reduce() {
+        if (wei_is_blocked_) {
+            emit_s_reduce_blocked_subbyte();
+            return;
+        }
         if (wei_is_subbyte_) {
             emit_s_reduce_subbyte();
             return;
@@ -511,6 +525,98 @@ private:
         dec(reg_k_iter);
         jmp(k_loop, T_NEAR);
         L(k_done);
+
+        for (int c = 0; c < chunks_; ++c)
+            vcvtdq2ps(vmm_S(c), vmm_S(c));
+    }
+
+    // Sub-byte (s4/u4) S-reduce over VNNI-blocked weights. AVX-512 only
+    // (factory enforces). For a 16-column chunk one 32-byte load holds
+    // `blocked_vnni` K rows; expanding the nibbles to bytes in order yields
+    // the s8 VNNI layout, so a dot product with byte ones adds up the K rows
+    // of every column in its dword lane.
+    void emit_s_reduce_blocked_subbyte() {
+        assert(is_zmm);
+        const Vmm vmm_data = vmm_data_sr();
+        const Vmm vmm_tmp = vmm_t1_sr();
+        const Vmm vmm_ones_w = vmm_t2_sr();
+        const Vmm vmm_ones_b = vmm_perm_sr();
+        const Vmm vmm_0f = vmm_0f_sr();
+        const Vmm vmm_8 = vmm_acc_sr();
+
+        for (int c = 0; c < chunks_; ++c)
+            uni_vpxor(vmm_S(c), vmm_S(c), vmm_S(c));
+
+        broadcast_byte_ones(vmm_ones_b);
+        mov(reg_tmp.cvt32(), 0x0F);
+        vpbroadcastb(vmm_0f, reg_tmp.cvt8());
+        if (wei_is_signed_) {
+            mov(reg_tmp.cvt32(), 0x08);
+            vpbroadcastb(vmm_8, reg_tmp.cvt8());
+        }
+        if (!has_vnni_) {
+            mov(reg_tmp.cvt32(), 1);
+            vpbroadcastw(vmm_ones_w, reg_tmp.cvt16());
+        }
+
+        const dim_t vnni_row_bytes = wei_n_blk_ * blocked_vnni / 2;
+        for (int c = 0; c < chunks_; ++c) {
+            Label skip_chunk, k_loop, k_done;
+            if (c > 0) {
+                mov(reg_iter, reg_stripe_w);
+                sub(reg_iter, c * simd_w);
+                jle(skip_chunk, T_NEAR);
+            }
+
+            // reg_a = wei + (n / wei_n_blk) * n_blk_stride
+            //             + (n % wei_n_blk) * blocked_vnni / 2
+            // `div` uses rdx:rax, i.e. reg_m:reg_n, both free before the
+            // m-loop.
+            load_param(reg_n, GET_OFF(n_base));
+            add(reg_n, c * simd_w);
+            xor_(reg_m, reg_m);
+            mov(reg_tmp, wei_n_blk_);
+            div(reg_tmp);
+            mov(reg_tmp, wei_n_blk_stride_bytes_);
+            imul(reg_n, reg_tmp);
+            imul(reg_m, reg_m, blocked_vnni / 2);
+            load_param(reg_a, GET_OFF(wei_batch_ptr));
+            add(reg_a, reg_n);
+            add(reg_a, reg_m);
+
+            // Number of VNNI row groups; padded rows of the blocked layout
+            // are zeros.
+            mov(reg_k_iter, reg_k_len);
+            add(reg_k_iter, blocked_vnni - 1);
+            shr(reg_k_iter, math::ilog2q(blocked_vnni));
+
+            L(k_loop);
+            test(reg_k_iter, reg_k_iter);
+            jz(k_done, T_NEAR);
+            {
+                vpmovzxbw(vmm_data, ptr[reg_a]);
+                vpsllw(vmm_tmp, vmm_data, 4);
+                // (low nibble | high nibble << 8) & 0x0F0F
+                vpternlogq(vmm_data, vmm_tmp, vmm_0f, 0xA8);
+                if (wei_is_signed_) {
+                    vpxord(vmm_data, vmm_data, vmm_8);
+                    vpsubb(vmm_data, vmm_data, vmm_8);
+                }
+                if (has_vnni_) {
+                    vpdpbusd(vmm_S(c), vmm_ones_b, vmm_data,
+                            Xbyak::EvexEncoding);
+                } else {
+                    vpmaddubsw(vmm_tmp, vmm_ones_b, vmm_data);
+                    vpmaddwd(vmm_tmp, vmm_tmp, vmm_ones_w);
+                    vpaddd(vmm_S(c), vmm_S(c), vmm_tmp);
+                }
+            }
+            add(reg_a, vnni_row_bytes);
+            dec(reg_k_iter);
+            jmp(k_loop, T_NEAR);
+            L(k_done);
+            L(skip_chunk);
+        }
 
         for (int c = 0; c < chunks_; ++c)
             vcvtdq2ps(vmm_S(c), vmm_S(c));
@@ -785,14 +891,33 @@ status_t per_mn_comp_kernel_t::is_applicable(
         return status::unimplemented;
 
     if (bgmmc->A_strides[0] != 1) return status::unimplemented;
-    if (bgmmc->B_strides[0] != 1) return status::unimplemented;
 
     const bool wei_is_subbyte
             = utils::one_of(bgmmc->orig_wei_dt, data_type::s4, data_type::u4);
-    if (wei_is_subbyte) {
-        if (!isa_has_masks(isa)) return status::unimplemented;
-        if (bgmmc->N_blk % 2 != 0) return status::unimplemented;
-        if (bgmmc->B_strides[1] % 2 != 0) return status::unimplemented;
+    if (bgmmc->blocked_B) {
+        // VNNI-blocked int4 weights (`BA16a<n>b4a`, `aCB16b<n>c4b`): the
+        // S-reduce reads 16-column chunks, each of which has to lie within a
+        // single N block, and walks K row groups contiguously within it.
+        constexpr int chunk_w = 16;
+        if (!wei_is_subbyte || !isa_has_masks(isa))
+            return status::unimplemented;
+        if (data_type_vnni_granularity(bgmmc->wei_dt) != 4)
+            return status::unimplemented;
+        if (bgmmc->wei_n_blk % chunk_w != 0) return status::unimplemented;
+        if (bgmmc->B_strides[1]
+                != bgmmc->b_dt_sz * bgmmc->wei_k_blk * bgmmc->wei_n_blk)
+            return status::unimplemented;
+        const bool n_base_aligned
+                = (bgmmc->N_blk % chunk_w == 0 || bgmmc->N_blk >= bgmmc->N)
+                && (bgmmc->LDC % chunk_w == 0 || bgmmc->LDC >= bgmmc->N_blk);
+        if (!n_base_aligned) return status::unimplemented;
+    } else {
+        if (bgmmc->B_strides[0] != 1) return status::unimplemented;
+        if (wei_is_subbyte) {
+            if (!isa_has_masks(isa)) return status::unimplemented;
+            if (bgmmc->N_blk % 2 != 0) return status::unimplemented;
+            if (bgmmc->B_strides[1] % 2 != 0) return status::unimplemented;
+        }
     }
 
     if (bgmmc->LDC <= 0 || bgmmc->M_blk <= 0 || bgmmc->N_blk <= 0)
