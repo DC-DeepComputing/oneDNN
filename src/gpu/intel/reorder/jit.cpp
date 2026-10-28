@@ -217,8 +217,13 @@ status_t gen_t::init(impl::engine_t *engine) {
     auto &cfg = *pd()->cfg;
     auto &info = *pd()->kernel_info;
 
-    kernel_ = make_kernel<kernel_t>(
-            this, engine, cfg, "gen_reorder", info, pd());
+    try {
+        kernel_ = make_kernel<kernel_t>(
+                this, engine, cfg, "gen_reorder", info, pd());
+    } catch (const std::exception &e) {
+        VERROR(primitive, gpu, "%s", e.what());
+        return status::unimplemented;
+    }
     if (!kernel_) return status::runtime_error;
     return status::success;
 }
