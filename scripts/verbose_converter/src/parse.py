@@ -373,7 +373,10 @@ class ParserImpl:
         post_op.mask = spec.read_uint()
         if spec.read_literal(":"):
             post_op.tag = spec.read_str()
-        # benchdnn can't do anything with src2 info yet.
+        if spec.read_literal(":"):
+            post_op.src2_mask = spec.read_uint()
+        if spec.read_literal(":"):
+            post_op.src2_tag = spec.read_str()
         return post_op
 
     @staticmethod
@@ -381,7 +384,11 @@ class ParserImpl:
         if not spec.read_literal(":"):
             raise ParseError("Expected data type for binary post-op")
         dt = spec.read_str()
-        post_op = ir.BinaryPostOp(alg=alg, dt=dt)
+        # A 0D or 1D operand does not print a tag, which benchdnn interprets
+        # as an "any" tag. Meanwhile, actual "any" tags are explicitly printed
+        # in the verbose line.
+        # Use "abx" as the default tag to align benchdnn and verbose behaviors.
+        post_op = ir.BinaryPostOp(alg=alg, dt=dt, tag="abx")
         if spec.read_literal(":"):
             post_op.mask = spec.read_uint()
         if spec.read_literal(":"):
@@ -399,12 +406,22 @@ class ParserImpl:
             return ir.Dropout()
         if not spec.read_literal(":"):
             return ir.Dropout(tag)
-        seed_dt = spec.read_str()
-        if not spec.read_literal(":"):
-            raise ParseError("Expected offset indicator for dropout")
+        # Sometimes the tag doesn't get printed, and the first entry
+        # is actually the seed data type. In that case, the string we just
+        # read is the seed data type, and the following field is the
+        # offset indicator. So, try to read an offset indicator, and if we
+        # succeed, treat the first field as the seed data type. In that case,
+        # the tag defaults to "abx".
         indicator = spec.read_literal("0") or spec.read_literal("1")
-        if indicator is None:
-            raise ParseError("Expected offset indicator for dropout")
+        if indicator:
+            seed_dt, tag = tag, "abx"
+        else:
+            seed_dt = spec.read_str()
+            if not spec.read_literal(":"):
+                raise ParseError("Expected offset indicator for dropout")
+            indicator = spec.read_literal("0") or spec.read_literal("1")
+            if indicator is None:
+                raise ParseError("Expected offset indicator for dropout")
         use_offset = indicator == "1"
         if not spec.read_literal(":"):
             raise ParseError("Expected host scalar indicator for dropout")

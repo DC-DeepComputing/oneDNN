@@ -16,6 +16,7 @@
 
 import functools
 import logging
+import math
 from collections import defaultdict
 from typing import Dict, List, Mapping, Optional, Set, cast
 
@@ -93,6 +94,10 @@ class Converter(metaclass=ConverterMeta):
         return ""
 
     @property
+    def encoding(self) -> str:
+        return ""
+
+    @property
     def grouped(self) -> str:
         return ""
 
@@ -139,6 +144,8 @@ class Converter(metaclass=ConverterMeta):
         return ":".join([po.alg, src1_arg, src2_arg])
 
     def _convert_binary_post_op(self, po: ir.BinaryPostOp):
+        if po.is_inplace():
+            return f"{po.alg}:{po.dt}"
         if po.strides != "":
             return f"{po.alg}:{po.dt}:{po.mask}:{po.tag}:{po.strides}"
         if po.tag != "any":
@@ -375,9 +382,10 @@ class StridesMixin(TagTripletMixin):
         tags = []
         strides = []
 
-        def add_strides_or_tag(arg, md):
-            if md.grouped is not None:
-                return  # grouped MDs go through --grouped
+        def add_strides_or_tag(arg, md: ir.MemoryDescriptor):
+            if md.format_kind == "sparse":
+                strides.append(md.strides)
+                return
             tag = maybe_make_any_tag(md)
             if arg == "wei" and str(md.flags.value) != "f0":
                 tag = "any"
@@ -622,6 +630,34 @@ class MatmulConverter(StridesMixin, MultiDataTypeWithBiasMixin, Converter):
                 mask = md.flags.value.split("_")[1][4:]
                 return f"--bia_mask={mask}"
         return ""
+
+    @property
+    def encoding(self):
+        src, wei = self.entry.shapes.split(":", 2)[:2]
+        *sb, m, sk = map(int, src.split("x"))
+        *wb, wk, n = map(int, wei.split("x"))
+        b = tuple(max(s, w) for s, w in zip(sb, wb))
+
+        counts = {
+            "src": math.prod(sb) * m * sk,
+            "wei": math.prod(wb) * wk * n,
+            "dst": math.prod(b) * m * n,
+        }
+
+        encodings: Dict[str, str] = {}
+        for md in self.entry.mds:
+            if md.arg not in counts:
+                continue
+            if md.format_kind != "sparse" or md.grouped:
+                continue
+            count = counts[md.arg]
+            nnz = max(200, count // 100)
+            sparsity = 1.00 - min(nnz / count, 1.00)
+            encodings[md.arg] = f"{md.tag}+{sparsity:.2f}"
+        if not encodings:
+            return ""
+        encoding = ":".join(encodings.get(arg, "") for arg in counts)
+        return f"--encoding={encoding}"
 
     @property
     def grouped(self) -> str:
@@ -995,6 +1031,41 @@ def get_converter(primitive: str) -> ConverterMeta:
     return converters[primitive]
 
 
+def warning_fn(fn):
+    @functools.lru_cache(maxsize=None)
+    @functools.wraps(fn)
+    def wrapper(logger: Optional[logging.Logger], *args):
+        if logger:
+            fn(logger, *args)
+
+    return wrapper
+
+
+@warning_fn
+def _warn_grouped(logger: logging.Logger):
+    logger.warning(
+        "Verbose does not report per-group sizes; group sizes in"
+        " --grouped are inferred by dividing the total dimension"
+        " by the number of groups and may not match the original."
+    )
+
+
+@warning_fn
+def _warn_sparse(logger: logging.Logger):
+    logger.warning(
+        "Verbose does not report sparsity; the --encoding sparsity values"
+        " are inferred by assuming 1% non-zero."
+    )
+
+
+@warning_fn
+def _warn_missing_converter(logger: logging.Logger, primitive: str):
+    logger.warning(
+        f"Missing converter for primitive '{primitive}';"
+        " the corresponding benchdnn arguments will not be generated."
+    )
+
+
 class InputGenerator:
     """
     Generates an input for benchdnn from internal representation.
@@ -1003,23 +1074,13 @@ class InputGenerator:
     def __init__(self, logger: Optional[logging.Logger] = None):
         self.logger = logger
 
-    @staticmethod
-    @functools.lru_cache(maxsize=None)
-    def _warn_grouped(logger: Optional[logging.Logger]):
-        if not logger:
-            return
-        logger.warning(
-            "Verbose does not report per-group sizes; group sizes in"
-            " --grouped are inferred by dividing the total dimension"
-            " by the number of groups and may not match the original."
-        )
-
     def _generate_case(self, entry: ir.Entry):
         Converter = get_converter(entry.prim_kind)
         converter = Converter(entry)
-        grouped = converter.grouped
-        if grouped:
-            self._warn_grouped(self.logger)
+        if converter.grouped:
+            _warn_grouped(self.logger)
+        if converter.encoding:
+            _warn_sparse(self.logger)
         args = [
             "--reset",
             "--allow-enum-tags-only=0",
@@ -1028,24 +1089,22 @@ class InputGenerator:
             converter.aux,
             converter.bias_mask,
             converter.dts,
+            converter.encoding,
             converter.tags,
             converter.flags,
             converter.attrs,
-            grouped,
+            converter.grouped,
             converter.shapes,
         ]
         return converter.driver, " ".join(arg for arg in args if arg)
 
     def generate(self, input, split_by_driver=False):
-        missing: Set[str] = set()
         data: Dict[str, List[str]] = defaultdict(list)
         for value in input.values():
             try:
                 driver, args = self._generate_case(value)
-            except KeyError as e:
-                if self.logger is not None and str(e) not in missing:
-                    missing.add(str(e))
-                    self.logger.warning(f"Missing converter: {e!s}")
+            except KeyError:
+                _warn_missing_converter(self.logger, value.prim_kind)
                 continue
             if not split_by_driver:
                 driver, args = "all", f"--{driver} {args}"
